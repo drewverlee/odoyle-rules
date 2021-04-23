@@ -94,12 +94,24 @@ Now imagine you want to make the player move to the right every time the frame i
      [:what
       [::time ::total tt]
       :then
+      (o/insert! ::player ::x tt)]}))
+```
+
+As an aside, you can also insert from inside a rule like this:
+
+```clj
+(def rules
+  (o/ruleset
+    {::move-player
+     [:what
+      [::time ::total tt]
+      :then
       (-> o/*session*
           (o/insert ::player ::x tt)
           o/reset!)]}))
 ```
 
-The `*session*` dynamic var will have the current value of the session, and `reset!` will update it so it has the newly-inserted value.
+The `*session*` dynamic var will have the current value of the session, and `reset!` will update it so it has the newly-inserted value. This is nice if you want to thread a lot of calls together, or if you want to write code that works the same both inside and outside of the rule.
 
 ## Queries
 
@@ -112,9 +124,7 @@ Updating the player's `::x` attribute isn't useful unless we can get the value e
      [:what
       [::time ::total tt]
       :then
-      (-> o/*session*
-          (o/insert ::player ::x tt)
-          o/reset!)]
+      (o/insert! ::player ::x tt)]
 
      ::player
      [:what
@@ -153,9 +163,7 @@ Imagine you want to move the player's position based on its current position. So
       [::time ::delta dt]
       [::player ::x x {:then false}] ;; don't run the :then block if only this is updated!
       :then
-      (-> o/*session*
-          (o/insert ::player ::x (+ x dt))
-          o/reset!)]}))
+      (o/insert! ::player ::x (+ x dt))]}))
 
 (reset! *session
   (-> (reduce o/add-rule (o/->session) rules)
@@ -197,9 +205,7 @@ Then we make the rule:
  [::window ::width window-width]
  :then
  (when (> x window-width)
-   (-> o/*session*
-       (o/insert ::player ::x window-width)
-       o/reset!))]
+   (o/insert! ::player ::x window-width))]
 ```
 
 Notice that we *don't* need `{:then false}` this time, because the condition is preventing the rule from re-firing.
@@ -214,9 +220,7 @@ While the above code works, you can also put your condition in a special `:when`
  :when
  (> x window-width)
  :then
- (-> o/*session*
-     (o/insert ::player ::x window-width)
-     o/reset!)]
+ (o/insert! ::player ::x window-width)]
 ```
 
 You can add as many conditions as you want, and they will implicitly work as if they were combined together with `and`:
@@ -230,9 +234,7 @@ You can add as many conditions as you want, and they will implicitly work as if 
  (> x window-width)
  (pos? window-width)
  :then
- (-> o/*session*
-     (o/insert ::player ::x window-width)
-     o/reset!)]
+ (o/insert! ::player ::x window-width)]
 ```
 
 Using a `:when` block is better because it also affects the results of `query-all` -- matches that didn't pass the conditions will not be included. Also, in the future I'll probably be able to create more optimal code because it will let me run those conditions earlier in the network.
@@ -346,6 +348,69 @@ The solution is to use `:then-finally`:
 
 A `:then-finally` block runs when a rule's matches are changed at all, including from retractions. This also means you won't have access to the bindings from the `:what` block, so if you want to run code on each individual match, you need to use a normal `:then` block before it.
 
+**Important rule of thumb:** When running `query-all` inside a rule, you should *only* query the rule you are inside of, not any other rule. We can illustrate this with an example.
+
+Let's say you want to create a derived fact that contains all characters that are within the window. We need the window dimensions, but we're using `:then-finally`, so we can't just add `[::window ::width window-width]` and `[::window ::height window-height]` to the `:what` block -- we don't have access to those bindings.
+
+Instead, you may be tempted to do this:
+
+```clj
+(defn within? [{:keys [x y]} window-width window-height]
+  (and (>= x 0)
+       (< x window-width)
+       (>= y 0)
+       (< y window-height)))
+
+(def rules
+  (o/ruleset
+    {::window
+     [:what
+      [::window ::width window-width]
+      [::window ::height window-height]]
+
+     ::character
+     [:what
+      [id ::x x]
+      [id ::y y]
+      :then-finally
+      (let [{:keys [window-width window-height]}
+            (first (o/query-all o/*session* ::window))] ;; warning: this will not be reactive!
+        (->> (o/query-all o/*session* ::character)
+             (filterv #(within? % window-width window-height))
+             (o/insert o/*session* ::derived ::characters-within-window)
+             o/reset!))]}))
+```
+
+Here, we are querying a getter rule to get the window dimensions, and using it to filter the characters. This will work initially, but if we change the window dimentions later, the `:character` rule with *not* re-run, so the `:characters-within-window` derived fact will be inaccurate.
+
+The solution, like is often true in software, is to pull things apart that shouldn't be together:
+
+```clj
+(def rules
+  (o/ruleset
+    {::character
+     [:what
+      [id ::x x]
+      [id ::y y]
+      :then-finally
+      (->> (o/query-all o/*session* ::character)
+           (o/insert o/*session* ::derived ::all-characters)
+           o/reset!)]
+
+     ::characters-within-window
+     [:what
+      [::window ::width window-width]
+      [::window ::height window-height]
+      [::derived ::all-characters all-characters]
+      :then
+      (->> all-characters
+           (filterv #(within? % window-width window-height))
+           (o/insert o/*session* ::derived ::characters-within-window)
+           o/reset!)]}))
+```
+
+First we create a derived fact holding all characters, and then in a separate rule we bring that fact in along with the window dimensions, and create the filtered fact from there. Since these are just normal facts in the `:what` block now, the rule will run when any of them are updated, just like we want it to.
+
 ## Serializing a session
 
 To save a session to the disk or send it over a network, we need to serialize it somehow. While O'Doyle sessions are mostly pure clojure data, it wouldn't be a good idea to directly serialize them. It would prevent you from updating your rules, or possibly even the version of this library, due to all the implementation details contained in the session map after deserializing it.
@@ -396,9 +461,7 @@ In any non-trivial project, you'll end up with a lot of rules that share some co
        [id ::x x {:then false}]
        [id ::y y {:then false}]
        :then
-       (-> o/*session*
-           (o/insert id {::x (+ x dt) ::y (+ y dt)})
-           o/reset!)]}))
+       (o/insert! id {::x (+ x dt) ::y (+ y dt)})]}))
 ```
 
 Here we have a `::character` rule whose only purpose is for queries, and a `::move-character` rule that modifies it when the timestamp is updated. In both cases, there is a join on the `id` binding. Joins are not free -- they have a runtime cost, and in this case, that cost is paid twice.
@@ -415,18 +478,14 @@ It turns out that a feature we've already discussed can solve this: derived fact
       [id ::x x]
       [id ::y y]
       :then
-      (-> o/*session*
-          (o/insert id ::character o/*match*)
-          o/reset!)]
+      (o/insert! id ::character o/*match*)]
 
       ::move-character
       [:what
        [::time ::delta dt]
        [id ::character ch {:then false}]
        :then
-       (-> o/*session*
-           (o/insert id {::x (+ (:x ch) dt) ::y (+ (:y ch) dt)})
-           o/reset!)]}))
+       (o/insert! id {::x (+ (:x ch) dt) ::y (+ (:y ch) dt)})]}))
 ```
 
 With `*match*` we can get all the bindings in a convenient map, such as `{:id ::player, :x 10, :y 5}`. We then insert it as a derived fact, and bring it into the `::move-character` rule.
@@ -470,6 +529,10 @@ should satisfy
 
   pos?
 ```
+
+Note that as of the latest version, O'Doyle will throw an error if spec is instrumented and you try to insert an attribute that doesn't have a corresponding spec defined. Even if you are lazy and define all your specs as `any?`, this can still help to prevent typos, including the common mistake of inserting attributes with the wrong namespace qualification.
+
+If you do *not* want O'Doyle to force attributes to all have specs defined, just call `(clojure.spec.test.alpha/unstrument 'odoyle.rules/insert)` after your `instrument` call.
 
 ## Development
 

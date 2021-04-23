@@ -5,6 +5,7 @@
             [#?(:clj clojure.edn :cljs cljs.reader) :as edn]))
 
 (st/instrument)
+(st/unstrument 'odoyle.rules/insert)
 
 ;; example 1
 
@@ -33,9 +34,7 @@
      [:what
       [::time ::total tt]
       :then
-      (-> o/*session*
-          (o/insert ::player ::x tt)
-          o/reset!)]}))
+      (o/insert! ::player ::x tt)]}))
 
 (reset! *session
   (-> (reduce o/add-rule (o/->session) rules-2)
@@ -78,9 +77,7 @@
       [::time ::delta dt]
       [::player ::x x {:then false}]
       :then
-      (-> o/*session*
-          (o/insert ::player ::x (+ x dt))
-          o/reset!)]}))
+      (o/insert! ::player ::x (+ x dt))]}))
 
 (reset! *session
   (-> (reduce o/add-rule (o/->session) rules-4)
@@ -112,9 +109,7 @@
       :when
       (> x window-width)
       :then
-      (-> o/*session*
-          (o/insert ::player ::x window-width)
-          o/reset!)]}))
+      (o/insert! ::player ::x window-width)]}))
 
 (reset! *session
   (-> (reduce o/add-rule (o/->session) rules-5)
@@ -189,7 +184,7 @@
      [:what
       [::derived ::all-characters all-characters]
       :then
-      (println "All characters:" all-characters)]}))
+      (println "All characters (using :then):" all-characters)]}))
 
 (test-derived-fact!
   (o/ruleset
@@ -206,7 +201,89 @@
      [:what
       [::derived ::all-characters all-characters]
       :then
-      (println "All characters:" all-characters)]}))
+      (println "All characters (using :then-finally):" all-characters)]}))
+
+(defn test-derived-fact-with-window-dimensions! [rules]
+  (reset! *session (reduce o/add-rule (o/->session) rules))
+  (swap! *session
+    (fn [session]
+      (o/insert session ::window {::width 100 ::height 100})))
+  (swap! *session
+    (fn [session]
+      (o/fire-rules
+        (reduce (fn [session [id x y]]
+                  (o/insert session id {::x x ::y y}))
+                session
+                [[0 -10 10]
+                 [1 10 10]
+                 [2 500 25]
+                 [3 25 70]
+                 [4 25 -10]
+                 [5 20 500]]))))
+  (swap! *session
+    (fn [session]
+      (-> session
+          (o/insert ::window {::width 1000 ::height 1000})
+          o/fire-rules))))
+
+(defn within? [{:keys [x y]} window-width window-height]
+  (and (>= x 0)
+       (< x window-width)
+       (>= y 0)
+       (< y window-height)))
+
+(test-derived-fact-with-window-dimensions!
+  (o/ruleset
+    {::window
+     [:what
+      [::window ::width window-width]
+      [::window ::height window-height]]
+
+     ::character
+     [:what
+      [id ::x x]
+      [id ::y y]
+      :then-finally
+      (let [{:keys [window-width window-height]}
+            (first (o/query-all o/*session* ::window))] ;; warning: this will not be reactive!
+        (->> (o/query-all o/*session* ::character)
+             (filterv #(within? % window-width window-height))
+             (o/insert o/*session* ::derived ::characters-within-window)
+             o/reset!))]
+
+     ::print-characters-within-window
+     [:what
+      [::derived ::characters-within-window all-characters]
+      :then
+      (println "Characters within window (not reactive):" all-characters)]}))
+
+(test-derived-fact-with-window-dimensions!
+  (o/ruleset
+    {::character
+     [:what
+      [id ::x x]
+      [id ::y y]
+      :then-finally
+      (->> (o/query-all o/*session* ::character)
+           (o/insert o/*session* ::derived ::all-characters)
+           o/reset!)]
+
+     ::characters-within-window
+     [:what
+      [::window ::width window-width]
+      [::window ::height window-height]
+      [::derived ::all-characters all-characters]
+      :then
+      (->> all-characters
+           (filterv #(within? % window-width window-height))
+           (o/insert o/*session* ::derived ::characters-within-window)
+           o/reset!)]
+
+     ::print-characters-within-window
+     [:what
+      [::derived ::characters-within-window all-characters]
+      :then
+      (println "Characters within window (reactive):" all-characters)]}))
 
 ;; example 9
 
@@ -248,18 +325,14 @@
       [id ::x x]
       [id ::y y]
       :then
-      (-> o/*session*
-          (o/insert id ::character o/*match*)
-          o/reset!)]
+      (o/insert! id ::character o/*match*)]
 
       ::move-character
       [:what
        [::time ::delta dt]
        [id ::character ch {:then false}]
        :then
-       (-> o/*session*
-           (o/insert id {::x (+ (:x ch) dt) ::y (+ (:y ch) dt)})
-           o/reset!)]}))
+       (o/insert! id {::x (+ (:x ch) dt) ::y (+ (:y ch) dt)})]}))
 
 (reset! *session
   (-> (reduce o/add-rule (o/->session) rules-11)
