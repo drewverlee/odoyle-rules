@@ -827,3 +827,116 @@
            (is (= 3 @*count))
            session)))))
 
+(deftest dynamic-rule
+  (let [*then-count (atom 0)
+        *then-finally-count (atom 0)]
+    (-> (o/add-rule
+          (o/->session)
+          (o/->rule
+            ::player
+            [:what
+             ['id :player/x 'x {:then not=}]
+             ['id :player/y 'y {:then not=}]
+             :when
+             (fn [{:keys [x y] :as match}]
+               (and (pos? x) (pos? y)))
+             :then
+             (fn [{:keys [id] :as match}]
+               (swap! *then-count inc))
+             :then-finally
+             (fn []
+               (swap! *then-finally-count inc))]))
+        (o/insert 1 {:player/x 3 :player/y 1})
+        (o/insert 2 {:player/x 5 :player/y 2})
+        (o/insert 3 {:player/x 7 :player/y -1})
+        o/fire-rules
+        (o/insert 1 {:player/x 3 :player/y 1})
+        o/fire-rules
+        ((fn [session]
+           (is (= 2 (count (o/query-all session ::player))))
+           (is (= 2 @*then-count))
+           (is (= 1 @*then-finally-count))
+           session)))))
+
+;; this is a demonstration of how literal values can cause a rule to fire
+;; more often than when a binding is used. the technical reason is that
+;; literal values are checked earlier on (in the alpha network).
+;; when the value changes and then returns to its original value,
+;; the entire match is retracted and then re-inserted, causing the rule to fire
+;; despite the {:then false} usage.
+;; with bindings, this is usually an in-place update, and the match is never
+;; fully retracted, so it doesn't need to fire the rule again.
+;; this difference in behavior isn't ideal but for now i can't think of a nice fix...
+(deftest literal-values-with-then-option-can-cause-extra-rule-firings
+  (let [*count-1 (atom 0)
+        *count-2 (atom 0)
+        ruleset-1 (o/ruleset
+                    {::rule1
+                     [:what
+                      [id ::retired retired {:then false}] ;; value is a binding
+                      [id ::age age]
+                      :when
+                      (not retired)
+                      :then
+                      (swap! *count-1 inc)]
+                     
+                     ::rule2
+                     [:what
+                      [id ::age age]
+                      :then
+                      (o/insert! id ::retired true)]
+                     
+                     ::rule3
+                     [:what
+                      [id ::retired true]
+                      :then
+                      (o/insert! id ::retired false)]})
+        ruleset-2 (o/ruleset
+                    {::rule1
+                     [:what
+                      [id ::retired false {:then false}] ;; value is a literal
+                      [id ::age age]
+                      :then
+                      (swap! *count-2 inc)]
+                     
+                     ::rule2
+                     [:what
+                      [id ::age age]
+                      :then
+                      (o/insert! id ::retired true)]
+                     
+                     ::rule3
+                     [:what
+                      [id ::retired true]
+                      :then
+                      (o/insert! id ::retired false)]})
+        session-1 (reduce o/add-rule (o/->session) ruleset-1)
+        session-2 (reduce o/add-rule (o/->session) ruleset-2)]
+    (-> session-1
+        (o/insert ::bob {::retired false ::age 50})
+        o/fire-rules
+        ((fn [session]
+           (is (= 1 @*count-1))
+           session)))
+    (-> session-2
+        (o/insert ::bob {::retired false ::age 50})
+        o/fire-rules
+        ((fn [session]
+           (is (= 2 @*count-2))
+           session)))))
+
+(deftest contains
+  (-> (reduce o/add-rule (o/->session)
+        (o/ruleset
+          {::num-conds-and-facts
+           [:what
+            [b ::color "blue"]]}))
+      (o/insert ::bob ::color "blue")
+      ((fn [session]
+         (is (o/contains? session ::bob ::color))
+         session))
+      (o/retract ::bob ::color)
+      ((fn [session]
+         (is (not (o/contains? session ::bob ::color)))
+         session))))
+

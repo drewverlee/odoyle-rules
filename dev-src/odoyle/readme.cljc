@@ -4,8 +4,16 @@
             [clojure.spec.test.alpha :as st]
             [#?(:clj clojure.edn :cljs cljs.reader) :as edn]))
 
+(s/def ::total number?)
+(s/def ::delta number?)
+(s/def ::x number?)
+(s/def ::y number?)
+(s/def ::width (s/and number? pos?))
+(s/def ::height (s/and number? pos?))
+(s/def ::character (s/keys :req-un [::x ::y]))
+(s/def ::all-characters (s/coll-of ::character))
+(s/def ::characters-within-window ::all-characters)
 (st/instrument)
-(st/unstrument 'odoyle.rules/insert)
 
 ;; example 1
 
@@ -300,11 +308,6 @@
 
 ;; example 10
 
-(s/def ::x number?)
-(s/def ::y number?)
-(s/def ::width (s/and number? pos?))
-(s/def ::height (s/and number? pos?))
-
 (reset! *session (reduce o/add-rule (o/->session) rules-6))
 
 (->
@@ -314,7 +317,8 @@
           (o/insert ::player {::x 20 ::y 15 ::width 0 ::height 15})
           o/fire-rules)))
   ;; print spec error but don't stop execution
-  #?(:clj (try (catch Exception e (println (.getMessage e))))))
+  #?(:clj (try (catch Exception e (println (.getMessage e))))
+     :cljs (try (catch js/Error e (println (.-message e))))))
 
 ;; example 11
 
@@ -342,3 +346,46 @@
       o/fire-rules))
 
 (println (o/query-all @*session ::character))
+
+;; example 12
+
+(def rule
+  (o/->rule
+    ::character
+    [:what
+     '[id ::x x]
+     '[id ::y y]
+     :when
+     (fn [{:keys [x y] :as match}]
+       (and (pos? x) (pos? y)))
+     :then
+     (fn [match]
+       (println "This will fire twice"))
+     :then-finally
+     (fn []
+       (println "This will fire once"))]))
+
+(-> (o/add-rule (o/->session) rule)
+    (o/insert 1 {::x 3 ::y 1})
+    (o/insert 2 {::x 5 ::y 2})
+    (o/insert 3 {::x 7 ::y -1})
+    o/fire-rules
+    (o/query-all ::character)
+    println)
+
+(defn ->character-rule [id]
+  (o/->rule id
+    [:what
+     [id ::x 'x]
+     [id ::y 'y]]))
+
+(reset! *session
+  (-> (o/->session)
+      (o/add-rule (->character-rule ::player))
+      (o/add-rule (->character-rule ::enemy))
+      (o/insert ::player {::x 20 ::y 15})
+      (o/insert ::enemy {::x 5 ::y 5})
+      o/fire-rules))
+
+(println (first (o/query-all @*session ::player)))
+(println (first (o/query-all @*session ::enemy)))

@@ -4,7 +4,7 @@
             [clojure.string :as str])
   #?(:cljs
       (:require-macros [odoyle.rules :refer [ruleset]]))
-  (:refer-clojure :exclude [reset!]))
+  (:refer-clojure :exclude [reset! contains?]))
 
 ;; parsing
 
@@ -14,7 +14,7 @@
 (s/def ::what-id (s/or :binding symbol? :value ::id))
 (s/def ::what-attr (s/or :value ::attr))
 (s/def ::what-value (s/or :binding symbol? :value ::value))
-(s/def ::then (s/or :bool boolean? :func symbol?))
+(s/def ::then (s/or :bool boolean? :func #(or (symbol? %) (fn? %))))
 (s/def ::what-opts (s/keys :opt-un [::then]))
 (s/def ::what-tuple (s/cat :id ::what-id, :attr ::what-attr, :value ::what-value, :opts (s/? ::what-opts)))
 (s/def ::what-block (s/cat :header #{:what} :body (s/+ (s/spec ::what-tuple))))
@@ -29,6 +29,15 @@
                 :then-finally-block (s/? ::then-finally-block)))
 
 (s/def ::rules (s/map-of qualified-keyword? ::rule))
+
+(s/def ::dynamic-when-block (s/cat :header #{:when} :body fn?))
+(s/def ::dynamic-then-block (s/cat :header #{:then} :body fn?))
+(s/def ::dynamic-then-finally-block (s/cat :header #{:then-finally} :body fn?))
+(s/def ::dynamic-rule (s/cat
+                        :what-block ::what-block
+                        :when-block (s/? ::dynamic-when-block)
+                        :then-block (s/? ::dynamic-then-block)
+                        :then-finally-block (s/? ::dynamic-then-finally-block)))
 
 (defn parse [spec content]
   (let [res (s/conform spec content)]
@@ -113,31 +122,40 @@
       (add-to-condition :attr attr)
       (add-to-condition :value value)))
 
-(defn ->rule [[rule-name rule]]
-  (let [{:keys [what-block when-block then-block then-finally-block]} rule
-        conditions (mapv ->condition (:body what-block))
-        when-body (:body when-block)
-        when-body (if (> (count when-body) 1)
-                    (cons 'and when-body)
-                    (first when-body))
-        then-body (:body then-block)
-        then-finally-body (:body then-finally-block)
-        syms (->> conditions
-                  (mapcat :bindings)
-                  (map :sym)
-                  (map last) ;; must do this because we quoted it above
-                  (filter simple-symbol?) ;; exclude qualified bindings from destructuring
-                  set
-                  vec)]
-    {:rule-name rule-name
-     :fn-name (-> (str (namespace rule-name) "-" (name rule-name))
-                  (str/replace "." "-")
-                  symbol)
-     :conditions conditions
-     :arg {:keys syms}
-     :when-body when-body
-     :then-body then-body
-     :then-finally-body then-finally-body}))
+(defn ->rule
+  "Returns a new rule. In most cases, you should use the `ruleset` macro to define rules,
+  but if you want to define rules dynamically, you can use this function instead.
+  See the README section \"Defining rules dynamically\".
+  The one-argument arity is only meant for internal use."
+  ([rule-name rule]
+   (let [{:keys [rule-name conditions when-body then-body then-finally-body]}
+         (->rule [rule-name (parse ::dynamic-rule rule)])]
+     (->Rule rule-name (mapv map->Condition conditions) when-body then-body then-finally-body)))
+  ([[rule-name parsed-rule]]
+   (let [{:keys [what-block when-block then-block then-finally-block]} parsed-rule
+         conditions (mapv ->condition (:body what-block))
+         when-body (:body when-block)
+         then-body (:body then-block)
+         then-finally-body (:body then-finally-block)
+         syms (->> conditions
+                   (mapcat :bindings)
+                   (map :sym)
+                   (map last) ;; must do this because we quoted it above
+                   (filter simple-symbol?) ;; exclude qualified bindings from destructuring
+                   set
+                   vec)]
+     {:rule-name rule-name
+      :fn-name (-> (str (namespace rule-name) "-" (name rule-name))
+                   (str/replace "." "-")
+                   symbol)
+      :conditions conditions
+      :arg {:keys syms}
+      :when-body (cond
+                   (fn? when-body) when-body
+                   (> (count when-body) 1) (cons 'and when-body)
+                   :else (first when-body))
+      :then-body then-body
+      :then-finally-body then-finally-body})))
 
 (defn- add-alpha-node [node new-nodes *alpha-node-path]
   (let [[new-node & other-nodes] new-nodes]
@@ -212,7 +230,7 @@
         (update :bindings (fn [bindings]
                             (reduce
                               (fn [bindings k]
-                                (if (contains? (:all bindings) k)
+                                (if (clojure.core/contains? (:all bindings) k)
                                   (update bindings :joins conj k)
                                   (update bindings :all conj k)))
                               (or bindings
@@ -225,14 +243,14 @@
       (let [var-key (:key cond-var)]
         (case (:field cond-var)
           :id
-          (if (and (contains? m var-key)
+          (if (and (clojure.core/contains? m var-key)
                    (not= (get m var-key) (:id fact)))
             (reduced nil)
             (assoc m var-key (:id fact)))
           :attr
           (throw (ex-info "Attributes cannot contain vars" {}))
           :value
-          (if (and (contains? m var-key)
+          (if (and (clojure.core/contains? m var-key)
                    (not= (get m var-key) (:value fact)))
             (reduced nil)
             (assoc m var-key (:value fact))))))
@@ -268,7 +286,7 @@
      (let [id+attr (get-id-attr alpha-fact)
            id+attrs (conj id+attrs id+attr)
            new-token (->Token alpha-fact (:kind token) nil)
-           new? (not (contains? (:old-id-attrs join-node) id+attr))]
+           new? (not (clojure.core/contains? (:old-id-attrs join-node) id+attr))]
        (left-activate-memory-node session (:child-id join-node) id+attrs new-vars new-token new?))
      session)))
 
@@ -359,7 +377,7 @@
                 (update-in [:id-attr-nodes id+attr]
                            (fn [node-paths]
                              (let [node-paths (or node-paths #{})]
-                               (assert (not (contains? node-paths node-path)))
+                               (assert (not (clojure.core/contains? node-paths node-path)))
                                (conj node-paths node-path)))))
             :retract
             (-> $
@@ -367,7 +385,7 @@
                 (update :id-attr-nodes
                         (fn [nodes]
                           (let [node-paths (get nodes id+attr)
-                                _ (assert (contains? node-paths node-path))
+                                _ (assert (clojure.core/contains? node-paths node-path))
                                 node-paths (disj node-paths node-path)]
                             (if (seq node-paths)
                               (assoc nodes id+attr node-paths)
@@ -415,7 +433,7 @@
             ;; retract any facts from nodes that the new fact wasn't inserted in
             (reduce
               (fn [session node-path]
-                (if (not (contains? node-paths node-path))
+                (if (not (clojure.core/contains? node-paths node-path))
                   (let [node (get-in session node-path)
                         old-fact (get-in node [:facts id attr])]
                     (assert old-fact)
@@ -426,7 +444,7 @@
             ;; update or insert facts, depending on whether the node already exists
             (reduce
               (fn [session node-path]
-                (if (contains? existing-node-paths node-path)
+                (if (clojure.core/contains? existing-node-paths node-path)
                   (let [node (get-in session node-path)
                         old-fact (get-in node [:facts id attr])]
                     (assert old-fact)
@@ -459,7 +477,7 @@
                       (reverse executed-nodes))
         ;; find all rules that execute themselves (directly or indirectly)
         find-cycles (fn find-cycles [cycles [k v] cyc]
-                      (if (contains? (set cyc) k)
+                      (if (clojure.core/contains? (set cyc) k)
                         (conj cycles (vec (drop-while #(not= % k) (conj cyc k))))
                         (reduce
                           (fn [cycles pair]
@@ -603,15 +621,16 @@
                                        (assoc join-node
                                               :id-key (some (fn [{:keys [field key]}]
                                                               (when (and (= :id field)
-                                                                         (contains? (:joins bindings) key))
+                                                                         (clojure.core/contains? (:joins bindings) key))
                                                                 key))
                                                             (-> join-node :condition :bindings))
                                               ;; disable fast updates for facts whose value is part of a join
-                                              :disable-fast-updates (contains? (:joins bindings)
-                                                                               (some (fn [{:keys [field key]}]
-                                                                                       (when (= :value field)
-                                                                                         key))
-                                                                                     (-> join-node :condition :bindings)))))))
+                                              :disable-fast-updates (clojure.core/contains?
+                                                                      (:joins bindings)
+                                                                      (some (fn [{:keys [field key]}]
+                                                                              (when (= :value field)
+                                                                                key))
+                                                                            (-> join-node :condition :bindings)))))))
                         session
                         (:join-node-ids session))]
     (-> session
@@ -726,9 +745,7 @@
 (defn insert!
   "Equivalent to:
   
-  (o/reset! (o/insert o/*session* id attr value))
-  
-  Using the long form is recommended."
+  (o/reset! (o/insert o/*session* id attr value))"
   ([id attr->value]
    (run! (fn [[attr value]]
            (insert! id attr value))
@@ -739,9 +756,7 @@
      (throw (ex-info "This function must be called in a :then or :then-finally block" {})))))
 
 (s/fdef retract
-  :args (s/cat :session ::session
-               :id ::id
-               :attr ::attr))
+  :args (s/cat :session ::session, :id ::id, :attr ::attr))
 
 (defn retract
   "Retracts the fact with the given id + attr combo."
@@ -759,23 +774,19 @@
       node-paths)))
 
 (s/fdef retract!
-  :args (s/cat :id ::id
-               :attr ::attr))
+  :args (s/cat :id ::id, :attr ::attr))
 
 (defn retract!
   "Equivalent to:
   
-  (o/reset! (o/retract o/*session* id attr))
-  
-  Using the long form is recommended."
+  (o/reset! (o/retract o/*session* id attr))"
   [id attr]
   (if *mutable-session*
     (vswap! *mutable-session* retract id attr)
     (throw (ex-info "This function must be called in a :then or :then-finally block" {}))))
 
 (s/fdef query-all
-  :args (s/cat :session ::session
-               :rule-name (s/? qualified-keyword?)))
+  :args (s/cat :session ::session, :rule-name (s/? qualified-keyword?)))
 
 (defn query-all
   "When called with just a session, returns a vector of all inserted facts.
@@ -798,6 +809,9 @@
        []
        (:matches rule)))))
 
+(s/fdef reset!
+  :args (s/cat :new-session ::session))
+
 (defn reset!
   "Mutates the session from a :then or :then-finally block."
   [new-session]
@@ -806,4 +820,12 @@
       (vreset! *mutable-session* new-session)
       (throw (ex-info "You may only call `reset!` once in a :then or :then-finally block" {})))
     (throw (ex-info "You may only call `reset!` in a :then or :then-finally block" {}))))
+
+(s/fdef contains?
+  :args (s/cat :session ::session, :id ::id, :attr ::attr))
+
+(defn contains?
+  "Returns true if the session contains a fact with the given id and attribute."
+  [session id attr]
+  (clojure.core/contains? (:id-attr-nodes session) [id attr]))
 
